@@ -5,58 +5,21 @@ import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
-
-SH_C0 = 0.28209479177387814
-SH_C1_x = 0.4886025119029199
-SH_C1_y = 0.4886025119029199
-SH_C1_z = 0.4886025119029199
-SH_C2_xy = 1.0925484305920792
-SH_C2_xz = 1.0925484305920792
-SH_C2_yz = -1.0925484305920792
-SH_C2_zz = 0.31539156525252005
-SH_C2_xx_yy = 0.5462742152960396
-SH_C3_yxx_yyy = -0.5900435899266435
-SH_C3_xyz = 2.890611442640554
-SH_C3_yzz_yxx_yyy = -0.4570457994644658
-SH_C3_zzz_zxx_zyy = 0.3731763325901154
-SH_C3_xzz_xxx_xyy = -0.4570457994644658
-SH_C3_zxx_zyy = 1.445305721320277
-SH_C3_xxx_xyy = -0.5900435899266435
+from utils.sh_utils import eval_sh
 
 
 def evaluate_sh(f_dc, f_rest, points, c2w):
-    sh = torch.empty((points.shape[0], 16, 3), device=points.device, dtype=points.dtype)
-    sh[:, 0] = f_dc
-    sh[:, 1:, 0] = f_rest[:, :15]
-    sh[:, 1:, 1] = f_rest[:, 15:30]
-    sh[:, 1:, 2] = f_rest[:, 30:45]
+    num_points = points.shape[0]
+    sh_rest = f_rest.reshape(num_points, 3, -1)
+    sh_coeffs = torch.cat([f_dc.unsqueeze(-1), sh_rest], dim=-1)
 
-    view_dir = points - c2w[:3, 3].unsqueeze(0)
+    camera_center = c2w[:3, 3].unsqueeze(0)
+    view_dir = points - camera_center
     view_dir = view_dir / (view_dir.norm(dim=-1, keepdim=True) + 1e-8)
-    x, y, z = view_dir[:, 0], view_dir[:, 1], view_dir[:, 2]
 
-    xx, yy, zz = x * x, y * y, z * z
-    xy, xz, yz = x * y, x * z, y * z
-
-    Y0 = torch.full_like(x, SH_C0)
-    Y1 = -SH_C1_y * y
-    Y2 = SH_C1_z * z
-    Y3 = -SH_C1_x * x
-    Y4 = SH_C2_xy * xy
-    Y5 = SH_C2_yz * yz
-    Y6 = SH_C2_zz * (3 * zz - 1)
-    Y7 = SH_C2_xz * xz
-    Y8 = SH_C2_xx_yy * (xx - yy)
-    Y9 = SH_C3_yxx_yyy * y * (3 * xx - yy)
-    Y10 = SH_C3_xyz * x * y * z
-    Y11 = SH_C3_yzz_yxx_yyy * y * (4 * zz - xx - yy)
-    Y12 = SH_C3_zzz_zxx_zyy * z * (2 * zz - 3 * xx - 3 * yy)
-    Y13 = SH_C3_xzz_xxx_xyy * x * (4 * zz - xx - yy)
-    Y14 = SH_C3_zxx_zyy * z * (xx - yy)
-    Y15 = SH_C3_xxx_xyy * x * (xx - 3 * yy)
-
-    Y = torch.stack([Y0, Y1, Y2, Y3, Y4, Y5, Y6, Y7, Y8, Y9, Y10, Y11, Y12, Y13, Y14, Y15], dim=1)
-    return torch.clamp_min((sh * Y.unsqueeze(2)).sum(dim=1) + 0.5, 0.0)
+    sh_degree = int(np.sqrt(sh_coeffs.shape[-1])) - 1
+    rgb = eval_sh(sh_degree, sh_coeffs, view_dir)
+    return torch.clamp_min(rgb + 0.5, 0.0)
 
 
 def project_points(pc, c2w, fx, fy, cx, cy):
@@ -151,7 +114,7 @@ def resolve_output_dir(args):
 
     # Keep outputs separated by scene/model to avoid overwriting existing renders.
     scene_name = None
-    if args.input_format == "original" and args.model_path:
+    if args.model_path:
         scene_name = Path(args.model_path).name
     elif args.trajectory_file:
         scene_name = Path(args.trajectory_file).stem
@@ -376,7 +339,6 @@ def render(
 
 def main():
     parser = argparse.ArgumentParser(description="PyTorch Gaussian renderer")
-    parser.add_argument("--input-format", default="pt", choices=["pt", "original"], help="Input mode: exported .pt tensors or original repo layout")
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="Execution device")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit number of rendered frames")
     parser.add_argument("--output-dir", default="novel_views", help="Base output folder for rendered frames (saved in a scene subfolder)")
@@ -392,7 +354,7 @@ def main():
     parser.add_argument("--images", default=None, help="Images folder name inside source-path (default: images)")
     parser.add_argument("--depths", default="", help="Optional depths folder name inside source-path")
     parser.add_argument("--eval", action="store_true", help="Enable train/test split logic for COLMAP scenes")
-    parser.add_argument("--trajectory-file", default=None, help="Optional .pt file with custom c2w poses [N,4,4] for original mode")
+    parser.add_argument("--trajectory-file", default=None, help="Optional file with custom c2w poses [N,4,4] for original mode")
 
     args = parser.parse_args()
 
@@ -403,36 +365,8 @@ def main():
     out_dir = resolve_output_dir(args)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.input_format == "pt":
-        pos = torch.load("trained_gaussians/kitchen/pos_7000.pt", map_location=device)
-        opacity_raw = torch.load("trained_gaussians/kitchen/opacity_raw_7000.pt", map_location=device)
-        f_dc = torch.load("trained_gaussians/kitchen/f_dc_7000.pt", map_location=device)
-        f_rest = torch.load("trained_gaussians/kitchen/f_rest_7000.pt", map_location=device)
-        scale_raw = torch.load("trained_gaussians/kitchen/scale_raw_7000.pt", map_location=device)
-        q_raw = torch.load("trained_gaussians/kitchen/q_rot_7000.pt", map_location=device)
-
-        cam_parameters = np.load("out_colmap/kitchen/cam_meta.npy", allow_pickle=True).item()
-        orbit_c2ws = torch.load("camera_trajectories/kitchen_orbit.pt", map_location=device)
-        sigma = build_sigma_from_params(scale_raw, q_raw)
-
-        frame_iter = orbit_c2ws if args.max_frames is None else orbit_c2ws[: args.max_frames]
-        for i, c2w_i in tqdm(enumerate(frame_iter), total=None if args.max_frames is None else len(frame_iter)):
-            c2w = c2w_i
-            H_src = cam_parameters["height"]
-            W_src = cam_parameters["width"]
-            H = H_src // args.resolution_divisor
-            W = W_src // args.resolution_divisor
-            fx, fy = cam_parameters["fx"], cam_parameters["fy"]
-            cx, cy = W_src / 2.0, H_src / 2.0
-            fx, fy, cx, cy = scale_intrinsics(H, W, H_src, W_src, fx, fy, cx, cy)
-
-            color = evaluate_sh(f_dc, f_rest, pos, c2w)
-            img = render(pos, color, opacity_raw, sigma, c2w, H, W, fx, fy, cx, cy)
-            Image.fromarray((img.cpu().numpy() * 255).astype(np.uint8)).save(out_dir / f"frame_{i:04d}.png")
-        return
-
     if args.model_path is None or args.source_path is None:
-        raise ValueError("--input-format original requires --model-path and --source-path")
+        raise ValueError("--model-path and --source-path are required")
 
     from scene.dataset_readers import sceneLoadTypeCallbacks
     from utils.graphics_utils import fov2focal
