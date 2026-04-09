@@ -116,7 +116,9 @@ def get_combined_args(parser : ArgumentParser):
     args_cfgfile = eval(cfgfile_string)
 
     merged_dict = vars(args_cfgfile).copy()
-    for k,v in vars(args_cmdline).items():
-        if v != None:
+    for k, v in vars(args_cmdline).items():
+        # Preserve cfg values when CLI provides None (sentinel mode),
+        # but still add missing keys so downstream code can safely access them.
+        if v is not None or k not in merged_dict:
             merged_dict[k] = v
     return Namespace(**merged_dict)
