@@ -8,7 +8,7 @@ from tqdm import tqdm
 from utils.sh_utils import eval_sh
 
 
-def evaluate_sh(f_dc, f_rest, points, c2w):
+def compute_color(f_dc, f_rest, points, c2w):
     num_points = points.shape[0]
     sh_rest = f_rest.reshape(num_points, 3, -1)
     sh_coeffs = torch.cat([f_dc.unsqueeze(-1), sh_rest], dim=-1)
@@ -22,7 +22,7 @@ def evaluate_sh(f_dc, f_rest, points, c2w):
     return torch.clamp_min(rgb + 0.5, 0.0)
 
 
-def project_points(pc, c2w, fx, fy, cx, cy):
+def world_to_image(pc, c2w, fx, fy, cx, cy):
     w2c = torch.eye(4, device=pc.device)
     R = c2w[:3, :3]
     t = c2w[:3, 3]
@@ -37,7 +37,7 @@ def project_points(pc, c2w, fx, fy, cx, cy):
     return uv, x, y, z
 
 
-def inv2x2(M, eps=1e-12):
+def invert_mat(M, eps=1e-12):
     a = M[:, 0, 0]
     b = M[:, 0, 1]
     c = M[:, 1, 0]
@@ -51,7 +51,7 @@ def inv2x2(M, eps=1e-12):
     inv[:, 1, 1] = a / safe_det
     return inv
 
-def quat_to_rotmat(quat):
+def to_rotmat(quat):
     r, x, y, z = quat.unbind(dim=-1)
     xx, yy, zz = x * x, y * y, z * z
     xy, xz, yz = x * y, x * z, y * z
@@ -64,15 +64,15 @@ def quat_to_rotmat(quat):
     ], dim=-1).reshape(quat.shape[:-1] + (3, 3))
     return R
 
-def build_sigma_from_params(scale_raw, q_raw):
+def compute_sigma(scale_raw, q_raw):
     scale = torch.exp(scale_raw).clamp_min(1e-6)
     q = q_raw / (q_raw.norm(dim=-1, keepdim=True) + 1e-9)
-    R = quat_to_rotmat(q)
+    R = to_rotmat(q)
     S = torch.diag_embed(scale)
     return R @ S @ S @ R.transpose(1, 2)
 
 
-def scale_intrinsics(H, W, H_src, W_src, fx, fy, cx, cy):
+def intrinsics_rescale(H, W, H_src, W_src, fx, fy, cx, cy):
     scale_x = W / W_src
     scale_y = H / H_src
     fx_scaled = fx * scale_x
@@ -82,7 +82,7 @@ def scale_intrinsics(H, W, H_src, W_src, fx, fy, cx, cy):
     return fx_scaled, fy_scaled, cx_scaled, cy_scaled
 
 
-def load_gaussians_from_ply(ply_path, device):
+def load_ply(ply_path, device):
     from plyfile import PlyData
 
     ply = PlyData.read(ply_path)
@@ -101,7 +101,7 @@ def load_gaussians_from_ply(ply_path, device):
     return pos, opacity_raw, f_dc, f_rest, scale_raw, q_raw
 
 
-def camera_info_to_c2w(cam_info, device):
+def cam_to_c2w(cam_info, device):
     Rt = np.eye(4, dtype=np.float32)
     Rt[:3, :3] = cam_info.R.transpose()
     Rt[:3, 3] = cam_info.T
@@ -150,7 +150,7 @@ def render(
     else:
         bg = torch.as_tensor(bg_color, device=pos.device, dtype=pos.dtype).reshape(3)
 
-    uv, x, y, z = project_points(pos, c2w, fx, fy, cx, cy)
+    uv, x, y, z = world_to_image(pos, c2w, fx, fy, cx, cy)
     in_guard = (uv[:, 0] > -pix_guard) & (uv[:, 0] < W + pix_guard) & (uv[:, 1] > -pix_guard) & (uv[:, 1] < H + pix_guard) & (z > near) & (z < far)
 
     uv = uv[in_guard]
@@ -278,7 +278,7 @@ def render(
     start[1:] = torch.cumsum(nb_gaussian_per_tile[:-1], dim=0)
     end = start + nb_gaussian_per_tile
 
-    inverse_covariance = inv2x2(sigma_camera)
+    inverse_covariance = invert_mat(sigma_camera)
     inverse_covariance[:, 0, 0] = torch.clamp(inverse_covariance[:, 0, 0], min=min_conis)
     inverse_covariance[:, 1, 1] = torch.clamp(inverse_covariance[:, 1, 1], min=min_conis)
 
@@ -342,17 +342,15 @@ def main():
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="Execution device")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit number of rendered frames")
     parser.add_argument("--output-dir", default="novel_views", help="Base output folder for rendered frames (saved in a scene subfolder)")
-    parser.add_argument("--antialiasing", dest="antialiasing", action="store_true", help="Enable antialiasing (default)")
-    parser.add_argument("--no-antialiasing", dest="antialiasing", action="store_false", help="Disable antialiasing")
-    parser.set_defaults(antialiasing=True)
+    parser.add_argument("--antialiasing", action="store_true", help="Enable antialiasing")
     parser.add_argument("--resolution-divisor", type=int, default=2, help="Render at 1/divisor of source resolution")
 
-    parser.add_argument("--model-path", default=None, help="Path to trained model folder (contains point_cloud/iteration_*/point_cloud.ply)")
-    parser.add_argument("--source-path", default=None, help="Path to source scene folder (contains sparse/0 for COLMAP)")
+    parser.add_argument("--model-path", "-m", default=None, help="Path to trained model folder (contains point_cloud/iteration_*/point_cloud.ply)")
+    parser.add_argument("--source-path", "-s", default=None, help="Path to source scene folder (contains sparse/0 for COLMAP)")
     parser.add_argument("--iteration", type=int, default=-1, help="Iteration to load for original format (-1 = latest)")
     parser.add_argument("--split", default="test", choices=["train", "test"], help="Which camera split to render in original format")
-    parser.add_argument("--images", default=None, help="Images folder name inside source-path (default: images)")
-    parser.add_argument("--depths", default="", help="Optional depths folder name inside source-path")
+    parser.add_argument("--images", "-i", default=None, help="Images folder name inside source-path (default: images)")
+    parser.add_argument("--depths", "-d", default="", help="Optional depths folder name inside source-path")
     parser.add_argument("--eval", action="store_true", help="Enable train/test split logic for COLMAP scenes")
     parser.add_argument("--trajectory-file", default=None, help="Optional file with custom c2w poses [N,4,4] for original mode")
 
@@ -366,7 +364,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.model_path is None or args.source_path is None:
-        raise ValueError("--model-path and --source-path are required")
+        raise ValueError("--model_path and --source_path are required")
 
     from scene.dataset_readers import sceneLoadTypeCallbacks
     from utils.graphics_utils import fov2focal
@@ -378,8 +376,8 @@ def main():
     if not ply_path.exists():
         raise FileNotFoundError(f"Could not find Gaussian PLY at {ply_path}")
 
-    pos, opacity_raw, f_dc, f_rest, scale_raw, q_raw = load_gaussians_from_ply(str(ply_path), device)
-    sigma = build_sigma_from_params(scale_raw, q_raw)
+    pos, opacity_raw, f_dc, f_rest, scale_raw, q_raw = load_ply(str(ply_path), device)
+    sigma = compute_sigma(scale_raw, q_raw)
 
     scene_info = sceneLoadTypeCallbacks["Colmap"](
         args.source_path,
@@ -406,11 +404,11 @@ def main():
         fx = fov2focal(ref_cam.FovX, ref_cam.width)
         fy = fov2focal(ref_cam.FovY, ref_cam.height)
         cx, cy = W_src / 2.0, H_src / 2.0
-        fx, fy, cx, cy = scale_intrinsics(H, W, H_src, W_src, fx, fy, cx, cy)
+        fx, fy, cx, cy = intrinsics_rescale(H, W, H_src, W_src, fx, fy, cx, cy)
 
         for i, c2w_i in tqdm(enumerate(frame_iter), total=None if args.max_frames is None else len(frame_iter)):
             c2w = c2w_i.to(device=device, dtype=pos.dtype)
-            color = evaluate_sh(f_dc, f_rest, pos, c2w)
+            color = compute_color(f_dc, f_rest, pos, c2w)
             img = render(
                 pos,
                 color,
@@ -432,16 +430,16 @@ def main():
         cam_infos = cam_infos[: args.max_frames]
 
     for i, cam in tqdm(enumerate(cam_infos), total=len(cam_infos)):
-        c2w = camera_info_to_c2w(cam, device)
+        c2w = cam_to_c2w(cam, device)
         H_src, W_src = cam.height, cam.width
         H = H_src // args.resolution_divisor
         W = W_src // args.resolution_divisor
         fx = fov2focal(cam.FovX, cam.width)
         fy = fov2focal(cam.FovY, cam.height)
         cx, cy = W_src / 2.0, H_src / 2.0
-        fx, fy, cx, cy = scale_intrinsics(H, W, H_src, W_src, fx, fy, cx, cy)
+        fx, fy, cx, cy = intrinsics_rescale(H, W, H_src, W_src, fx, fy, cx, cy)
 
-        color = evaluate_sh(f_dc, f_rest, pos, c2w)
+        color = compute_color(f_dc, f_rest, pos, c2w)
         img = render(
             pos,
             color,
